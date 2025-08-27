@@ -1,0 +1,484 @@
+import requests, logging, pytz, unicodedata, re
+import pandas as pd
+from io import StringIO
+from requests.auth import HTTPBasicAuth
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+from datetime import datetime
+from dateutil import parser
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("debug.log"),
+        logging.StreamHandler()
+    ]
+)
+
+def clean_sf_description(sf_description):
+    def extract_text(content, indent_level=0):
+        text = ""
+        skip_remaining = False
+
+        for element in content:
+            if skip_remaining:
+                continue
+
+            if element['type'] == 'paragraph':
+                paragraph_text = ""
+                for sub_element in element.get('content', []):
+                    if sub_element['type'] == 'text':
+                        sub_text = sub_element['text']
+                        marks = sub_element.get('marks', [])
+                        for mark in marks:
+                            if mark['type'] in ['italic', 'underline']:
+                                sub_text = f"_{sub_text}_"
+                        paragraph_text += sub_text
+
+                if re.match(r"^cc\:", paragraph_text.strip(), re.IGNORECASE):
+                    skip_remaining = True
+                    continue
+
+                # Bold specific headings
+                if paragraph_text.strip() in ["Overview/User Story", "Acceptance Criteria/Requirements"]:
+                    paragraph_text = f"**{paragraph_text.strip()}**"
+
+                # Add paragraph to text
+                text += ('    ' * indent_level) + paragraph_text + '\n'
+
+            elif element['type'] == 'bulletList':
+                for list_item in element.get('content', []):
+                    bullet_text = extract_text(list_item.get('content', []), indent_level + 1)
+                    text += bullet_text
+
+            elif element['type'] == 'table':
+                for row in element.get('content', []):
+                    for cell in row.get('content', []):
+                        for para in cell.get('content', []):
+                            if para['type'] == 'paragraph':
+                                for sub_element in para.get('content', []):
+                                    if sub_element['type'] == 'text':
+                                        sub_text = sub_element['text']
+                                        marks = sub_element.get('marks', [])
+                                        for mark in marks:
+                                            if mark['type'] in ['italic', 'underline']:
+                                                sub_text = f"_{sub_text}_"
+                                        text += sub_text + '\n'
+        return text
+
+    # Extract text from SF description
+    raw_text = extract_text(sf_description.get('content', []))
+
+    # Normalize and clean the raw text
+    normalized_text = unicodedata.normalize("NFKD", raw_text)
+    normalized_text = normalized_text.replace("â€˜", "'").replace("â€™", "'")
+    cleaned_text = re.sub(r'\n{2,}', '\n', normalized_text).strip()
+    cleaned_text = re.sub(r'^_([^_]+)_$', r'\1', cleaned_text, flags=re.MULTILINE)
+
+    return cleaned_text
+
+def format_date(date_str):
+    if not date_str:
+        return ""
+    try:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S.%f%z")
+        return date_obj.strftime("%Y-%m-%d %I:%M %p")
+    except ValueError:
+        return date_str
+    
+def get_sprint_status(start_date, end_date):
+    now = datetime.now(pytz.timezone('US/Eastern'))
+    if start_date > now:
+        return "Upcoming"
+    elif end_date < now:
+        return "Past"
+    else:
+        return "Active"
+
+def is_sprint_in_year(start_date, end_date, year):
+    # Check if the sprint start or end date is in the given year
+    return start_date.year == year or end_date.year == year
+
+def find_most_recent_past_sprint(sprints):
+    # Find the most recent sprint that has already ended (past)
+    now = datetime.now(pytz.timezone('US/Eastern'))
+    most_recent_sprint = None
+
+    for sprint in sprints:
+        if sprint['end_date'] < now:
+            if most_recent_sprint is None or sprint['end_date'] > most_recent_sprint['end_date']:
+                most_recent_sprint = sprint
+    return most_recent_sprint    
+
+azure_vault_url = 'https://mm-ccc-project-team-kv.vault.azure.net/'
+credential = ManagedIdentityCredential()
+client = SecretClient(vault_url=azure_vault_url, credential=credential)
+
+jira_client_id = client.get_secret("jira-client-id").value
+jira_client_secret = client.get_secret("jira-client-secret").value
+current_year = datetime.now().year
+base_url = "https://morgan.atlassian.net"
+lsi_jql = "project = LSI ORDER BY created DESC"
+ccc_jql = "project = CCC ORDER BY created DESC"
+jim_jql = (
+    'project = JIM AND '
+    'status NOT IN ("No longer needed", Done, Duplicate, "On Hold", "Confirmed in Production", "Blocked") '
+    'ORDER BY created DESC'
+)
+max_results = 100
+auth = HTTPBasicAuth(jira_client_id, jira_client_secret)
+
+headers = {
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
+
+start_at = 0
+lsi_issues = []
+
+while True:
+    params = {
+        "jql": lsi_jql,
+        "startAt": start_at,
+        "maxResults": max_results,
+        "fields": "key,summary,customfield_10006"
+    }
+
+    response = requests.get(
+        f"{base_url}/rest/api/3/search",
+        headers=headers,
+        auth=auth,
+        params=params,
+        verify=True
+    )
+
+    if response.status_code != 200:
+        logging.error(f"Error fetching issues: {response.status_code} - {response.text}")
+        break
+
+    data = response.json()
+    lsi_issues.extend(data.get('issues', []))
+    logging.info(f"Retrieved {len(data['issues'])} issues...")
+
+    if len(data['issues']) < max_results:
+        break
+
+    start_at += max_results
+
+# Extract LSI Sprint numbers and map them to issue keys
+lsi_sprint_issues = []
+for issue in lsi_issues:
+    issue_key = issue.get("key")
+    sprint_field = issue.get("fields", {}).get("customfield_10006", []) or []
+
+    if isinstance(sprint_field, list):
+        for sprint in sprint_field:
+            sprint_name = sprint.get("name", "")
+            sprint_start = sprint.get("startDate")
+            sprint_end = sprint.get("endDate")
+
+            # Parse the sprint start and end dates if available
+            if sprint_start and sprint_end:
+                start_date = parser.parse(sprint_start)
+                end_date = parser.parse(sprint_end)
+
+                # Only process the sprint if it is in 2025
+                if is_sprint_in_year(start_date, end_date, current_year):
+                    # Get the sprint status (active, past, or upcoming)
+                    sprint_status = get_sprint_status(start_date, end_date)
+                    if "LSI Sprint" in sprint_name:
+                        try:
+                            sprint_number = int(sprint_name.split()[-1])
+                            lsi_sprint_issues.append({
+                                'sprint_name': sprint_name,
+                                'sprint_number': sprint_number,
+                                'start_date': start_date,
+                                'end_date': end_date,
+                                'issue_key': issue_key
+                            })
+                        except ValueError:
+                            print(f"Could not extract sprint number from: {sprint_name}")
+
+# Sort all sprints by start date
+lsi_sprint_issues_sorted = sorted(lsi_sprint_issues, key=lambda x: x['start_date'])
+now = datetime.now(pytz.timezone('US/Eastern'))
+
+# Initialize containers
+past_sprints = []
+current_sprint = None
+upcoming_sprints = []
+
+# Categorize sprints
+for sprint in lsi_sprint_issues_sorted:
+    start = sprint['start_date']
+    end = sprint['end_date']
+
+    if end < now:
+        previous_sprint = sprint  # Will keep updating to get the most recent past
+    elif start <= now <= end:
+        current_sprint = sprint
+    elif start > now:
+        upcoming_sprints.append(sprint)
+
+
+# Get the last two past sprints
+previous_two_sprints = past_sprints[-2:] if len(past_sprints) >= 2 else past_sprints
+
+# Select next two upcoming sprints
+next_upcoming_sprint = upcoming_sprints[:1]
+
+# Combine selected sprints
+selected_sprints = previous_two_sprints
+if current_sprint:
+    selected_sprints.append(current_sprint)
+selected_sprints.extend(next_upcoming_sprint)
+
+
+# Extract issue keys from selected sprints
+selected_sprint_numbers = {s['sprint_number'] for s in selected_sprints}
+sprint_issue_keys = [
+    issue['issue_key']
+    for issue in lsi_sprint_issues
+    if issue['sprint_number'] in selected_sprint_numbers
+]
+
+lsi_issue_details = []
+
+for issue_key in sprint_issue_keys:
+    issue_url = f"{base_url}/rest/api/3/issue/{issue_key}"
+
+    response = requests.get(
+        issue_url,
+        headers=headers,
+        auth=auth,
+        verify=True
+    )
+
+    if response.status_code == 200:
+        issue_data = response.json()
+        fields = issue_data.get("fields", {})
+        inward_links = {}
+        outward_links = {}
+
+        for link in fields.get("issuelinks", []):
+            link_type = link.get("type", {}).get("name", "")
+            if link.get("inwardIssue"):
+                inward_links.setdefault(link_type, []).append(link["inwardIssue"]["key"])
+            if link.get("outwardIssue"):
+                outward_links.setdefault(link_type, []).append(link["outwardIssue"]["key"])
+
+        sf_description_raw = fields.get("customfield_11220", {})
+        cleaned_sf_description = clean_sf_description(sf_description_raw) if sf_description_raw else "No description available"
+
+        lsi_details = {
+            "Issue Key": issue_data.get("key"),
+            "Issue Type": fields.get("issuetype", {}).get("name"),
+            "Priority": fields.get("priority", {}).get("name"),
+            "Summary": fields.get("summary"),
+            "SF Description": cleaned_sf_description,
+            "Status": fields.get("status", {}).get("name"),
+            "Project Key": fields.get("project", {}).get("key"),
+            "Sprint": ', '.join(sorted([sn.get("name") for sn in (fields.get("customfield_10006") or []) if sn.get("name")], key=lambda x: int(x.split()[-1]), reverse=True  )), # Sort from most recent to oldest
+            "Assignee": fields.get("assignee", {}).get("displayName", "Unassigned") if fields.get("assignee") else "Unassigned",
+            "Reporter": fields.get("reporter", {}).get("displayName"),
+            "Business Requestor": ', '.join(fields.get("customfield_11320", [])) if isinstance(fields.get("customfield_11320"), list) else fields.get("customfield_11320", "No Value"),
+            "Stakeholders": ', '.join(fields.get("customfield_11321", [])) if isinstance(fields.get("customfield_11321"), list) else fields.get("customfield_11321", "No Value"),
+            "Created": format_date(fields.get("created")),
+            "Updated": format_date(fields.get("updated")),
+            "Due Date": format_date(fields.get("duedate")),
+            "Litigation/Line of Business": (", ".join([item.get("value", "") for item in fields["customfield_11890"]])if isinstance(fields.get("customfield_11890"), list)else fields.get("customfield_11890", {}).get("value")if isinstance(fields.get("customfield_11890"), dict)else None),
+            "Case Types": (", ".join([item.get("value", "") for item in fields["customfield_11891"]])if isinstance(fields.get("customfield_11891"), list)else fields.get("customfield_11891", {}).get("value")if isinstance(fields.get("customfield_11891"), dict)else None),
+            "Actual Story Points": fields.get("customfield_11335"),
+            "Admin/Dev Tracking": ', '.join([dn.get("displayName") for dn in (fields.get("customfield_11293") or []) if dn.get("displayName")]),
+            "Inward Links": ', '.join([f"{k}: {', '.join(v)}" for k, v in inward_links.items()]),
+            "Outward Links": ', '.join([f"{k}: {', '.join(v)}" for k, v in outward_links.items()]),
+            "QA Assigned Date": fields.get("customfield_11440"),
+            "CCC - UAT": fields.get("customfield_11323", {}).get("displayName", "N/A") if isinstance(fields.get("customfield_11323"), dict) else "N/A",
+            "CCC - PROD": fields.get("customfield_11324", {}).get("displayName", "N/A") if isinstance(fields.get("customfield_11324"), dict) else "N/A",
+            "Epic Link": fields.get("customfield_10002"),
+            "Story Points Completed Last Sprint": fields.get("customfield_11540"),
+            "Ticket Completed in 1 Sprint?": fields.get("customfield_11541"),
+            "QA Story Points": fields.get("customfield_11362"),
+        }
+        
+        lsi_issue_details.append(lsi_details)
+    else:
+        print(f"Failed to fetch details for {issue_key}: {response.status_code}")
+
+lsi_df = pd.DataFrame(lsi_issue_details)
+
+
+### CCC Issues###
+start_at = 0
+ccc_issues = []
+
+while True:
+    params = {
+        "jql": ccc_jql,
+        "startAt": start_at,
+        "maxResults": max_results,
+        "fields": "key,summary,customfield_10006"
+    }
+
+    response = requests.get(
+        f"{base_url}/rest/api/3/search",
+        headers=headers,
+        auth=auth,
+        params=params,
+        verify=True
+    )
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code} - {response.text}")
+        break
+
+    data = response.json()
+    ccc_issues.extend(data.get('issues', []))
+
+    print(f"Retrieved {len(data['issues'])} issues...")
+
+    if len(data['issues']) < max_results:
+        break
+
+    start_at += max_results
+
+ccc_issue_details=[]
+excluded_statuses = ["No longer needed", "Done", "Duplicate", "On Hold", "Confirmed in Production"]
+for issue in ccc_issues:
+    issue_key = issue['key']
+    issue_url = f"{base_url}/rest/api/3/issue/{issue_key}"
+
+    response = requests.get(
+        issue_url,
+        headers=headers,
+        auth=auth,
+        verify=True
+    )
+
+    if response.status_code == 200:
+        issue_data = response.json()
+        fields = issue_data.get("fields", {})
+        status = fields.get("status", {}).get("name", "No Status")
+
+        if status in excluded_statuses:
+            continue
+
+        sf_description_raw = fields.get("customfield_11220", {})
+        cleaned_sf_description = clean_sf_description(sf_description_raw) if sf_description_raw else "No description available"
+
+        ccc_details = {
+            "Issue Key": issue_data.get("key"),
+            "Summary": fields.get("summary"),
+            "Priority": fields.get("priority", {}).get("name"),
+            "Project Key": fields.get("project", {}).get("key"),
+            "Created": format_date(fields.get("created")),
+            "Status": fields.get("status", {}).get("name", "No Status"),
+            "Business Requestor": ', '.join(fields.get("customfield_11320", [])) if isinstance(fields.get("customfield_11320"), list) else fields.get("customfield_11320", "No Value"),
+            "SF Description": cleaned_sf_description,
+        }
+        
+        ccc_issue_details.append(ccc_details)
+    else:
+        print(f"Failed to fetch details for {issue_key}: {response.status_code}")
+
+ccc_df = pd.DataFrame(ccc_issue_details)
+
+###Jimmy Issues###
+
+start_at = 0
+jim_issues = []
+
+while True:
+    params = {
+        "jql": jim_jql,
+        "startAt": start_at,
+        "maxResults": max_results,
+        "fields": "key,summary"
+    }
+
+    response = requests.get(
+        f"{base_url}/rest/api/3/search",
+        headers=headers,
+        auth=auth,
+        params=params,
+        verify=True
+    )
+
+    if response.status_code != 200:
+        print(f"Error: {response.status_code} - {response.text}")
+        break
+
+    data = response.json()
+    jim_issues.extend(data.get('issues', []))
+
+    print(f"Retrieved {len(data['issues'])} issues...")
+
+    if len(data['issues']) < max_results:
+        break
+
+    start_at += max_results
+
+jim_issue_details = []
+excluded_statuses = ["No longer needed", "Done", "Duplicate", "On Hold", "Confirmed in Production"]
+
+for issue in jim_issues:
+    issue_key = issue['key']
+    issue_url = f"{base_url}/rest/api/3/issue/{issue_key}"
+
+    response = requests.get(
+        issue_url,
+        headers=headers,
+        auth=auth,
+        verify=True
+    )
+
+    if response.status_code == 200:
+        issue_data = response.json()
+        fields = issue_data.get("fields", {})
+        status = fields.get("status", {}).get("name", "No Status")
+
+        if status in excluded_statuses:
+            continue
+
+        jim_details = {
+            "Issue Key": issue_data.get("key"),
+            "Summary": fields.get("summary"),
+            "Priority": fields.get("priority", {}).get("name"),
+            "Project Key": fields.get("project", {}).get("key"),
+            "Assignee": fields["assignee"]["displayName"] if fields.get("assignee") else "Unassigned",
+            "Reporter": fields.get("reporter", {}).get("displayName"),
+            "Created": format_date(fields.get("created")),
+            "Status": status
+        }
+
+        jim_issue_details.append(jim_details)
+    else:
+        print(f"Failed to fetch details for {issue_key}: {response.status_code}")
+
+jim_df = pd.DataFrame(jim_issue_details)
+
+# Save the DataFrame to a CSV file
+eastern = pytz.timezone("US/Eastern")
+date = datetime.now(eastern).strftime("%Y-%m-%d_%H-%M")
+lsi_jira_path = f"LSI_Issues_{date}.csv"
+ccc_jira_path = f"CCC_Issues_{date}.csv"
+jim_jira_path = f"JIM_Issues_{date}.csv"
+
+connection_string = client.get_secret("azure-connection-string").value
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+container = "jira-issues"
+container_client = blob_service_client.get_container_client(container)
+
+def save_csv(container_client, df, path):
+    csv_buffer = StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_data = csv_buffer.getvalue().encode('utf-8-sig')
+    blob_client = container_client.get_blob_client(path)
+    blob_client.upload_blob(csv_data, overwrite=True)
+
+# Save data to the respective containers#
+save_csv(container_client, lsi_df, lsi_jira_path)
+save_csv(container_client, ccc_df, ccc_jira_path)
+save_csv(container_client, jim_df, jim_jira_path)
