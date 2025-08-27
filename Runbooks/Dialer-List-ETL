@@ -1,0 +1,286 @@
+import requests, json, base64, pytz, logging
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+from datetime import datetime, timedelta
+import os
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("debug.log"),
+        logging.StreamHandler()
+    ]
+)
+
+azure_vault_url = 'https://mm-ccc-project-team-kv.vault.azure.net/'
+credential = ManagedIdentityCredential()
+client = SecretClient(vault_url=azure_vault_url, credential=credential)
+eastern = pytz.timezone('America/New_York')
+eastern_time = datetime.now(eastern)
+timestamp = eastern_time.strftime("%m%d%Y %H-%M")
+current_est_time = datetime.now(pytz.timezone("US/Eastern")).strftime('%Y-%m-%d %H:%M:%S')
+
+def convert_to_est(utc_time_str):
+    utc_time = datetime.strptime(utc_time_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+    utc_time = utc_time.replace(tzinfo=pytz.UTC)
+    est = pytz.timezone("US/Eastern")
+    est_time = utc_time.astimezone(est)
+    return est_time.strftime('%Y-%m-%d %H:%M:%S')
+
+def is_list_exhausted(total_records, fresh_records, finalized_records, retried_records, update_date):
+    total_records = int(total_records)
+    fresh_records = int(fresh_records)
+    finalized_records = int(finalized_records)
+    retried_records = int(retried_records)
+    
+    if total_records == finalized_records and retried_records == 0 and fresh_records == 0:
+        return  update_date
+    return None
+
+############################## Get Token ##############################
+cxone_client_id = client.get_secret("cxone-client-id").value
+cxone_client_secret = client.get_secret("cxone-client-secret").value
+cxone_access_key = client.get_secret('cxone-access-key').value
+cxone_access_secret = client.get_secret('cxone-access-secret').value
+
+credentials = f"{cxone_client_id}:{cxone_client_secret}"
+encoded_credentials = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
+
+url = "https://cxone.niceincontact.com/auth/token"
+payload = {
+    'grant_type': 'password',
+    'username': cxone_access_key,
+    'password': cxone_access_secret
+}
+headers = {
+    'Authorization': f'Basic {encoded_credentials}',
+    'Content-Type': 'application/x-www-form-urlencoded'
+}
+
+response = requests.request("POST", url, headers=headers, data=payload)
+if response.status_code == 200:
+    json_response = json.loads(response.text)
+    cxone_access_token = json_response.get('access_token')
+    cxone_token_type = json_response.get('token_type')
+    logging.info("Successfully retrieved access token.")
+else:
+    logging.error(f"Failed to retrieve access token: {response.status_code}, {response.text}")
+    
+
+############################## Pull List Summary ##############################
+url = "https://api-na1.niceincontact.com/inContactAPI/services/v26.0/lists/call-lists"
+payload = {}
+headers = {'Authorization': f'{cxone_token_type} {cxone_access_token}'}
+
+lists_response = requests.request("GET", url, headers=headers, data=payload)
+
+if lists_response.status_code == 200:
+    try:
+        dialer_data = json.loads(lists_response.text)
+        calling_lists = dialer_data.get('callingLists', [])
+        filtered_data = [item for item in calling_lists if item["status"] not in ['MarkedForRemoval', 'Deactivated']]
+        filtered_json = json.dumps(filtered_data, indent=4)
+        listids = []
+        for item in filtered_data:
+            list_id = item['listId']
+            listids.append(list_id)
+        skill_lists = []
+        for item in filtered_data:
+            list_id = item['listId']
+            list_name = item['listName']
+            create_date_utc = item['createDate']
+            create_date = convert_to_est(create_date_utc)
+            update_date_utc = item['updateDate']
+            update_date = convert_to_est(update_date_utc)
+            if 'skills' in item:
+                for skill in item['skills']:
+                    skill['listId'] = list_id
+                    skill['listName'] = list_name
+                    skill['createDate'] = create_date
+                    skill['updateDate'] = update_date
+                    skill_lists.append(skill)
+
+        skill_lists_json = json.dumps(skill_lists, indent=4)
+            
+    except json.JSONDecodeError as e:
+        logging.error(f"Error decoding JSON: {e}")
+        
+else:
+    logging.error(f"Request failed with status code: {lists_response.status_code}")
+    logging.error(lists_response.text)
+
+############################## Pull Dialer Contacts ##############################
+dialer_list = []
+for id in listids:
+    url = f"https://api-c30.incontact.com/incontactapi/services/v31.0/lists/call-lists/{id}?finalized=true&includeRecords=true"
+    dialerlst_response = requests.get(url, headers=headers)
+
+    if dialerlst_response.status_code == 200:
+        dialer_data = dialerlst_response.json()
+        dialer_contacts = dialer_data.get('resultSet', {})
+        contact_records = dialer_contacts.get('contactRecords', [])
+        contact_skills = dialer_contacts.get('skills', [])
+        
+        formatted_contacts = {
+            "listId": id,
+            "listName": dialer_contacts.get('listName', ''),
+            "skillName": dialer_contacts.get('listName', '').split(' - ')[0],
+            "status": dialer_contacts.get('status', ''),
+            "createDate": convert_to_est(dialer_contacts.get('createDate', '')),
+            "updateDate": convert_to_est(dialer_contacts.get('updateDate', '')),
+            "totalRecords": 0,
+            "freshRecords": 0,
+            "retriedRecords": 0,
+            "finalizedRecords": 0,
+            "suppressedRecords": 0,
+            "unsuccessfulRecords": 0,
+            "contactedRecords": 0,
+            "contactRecords": [],
+        }
+
+        skill_found = False
+        for skill in contact_skills:
+            skill_id = skill.get("skillId", "")
+            
+            if not skill_id:
+                continue
+            
+            skill_found = True  # A valid skill was found
+            skill_name = skill.get("skillName", "")
+            total_records = int(skill.get("totalRecords", 0))
+            fresh_records = int(skill.get("freshRecords", 0))
+            finalized_records = int(skill.get("finalizedRecords", 0))
+            retried_records = int(skill.get("retriedRecords", 0))
+            is_exhausted = is_list_exhausted(total_records, fresh_records, finalized_records, retried_records, formatted_contacts["updateDate"])
+
+            formatted_contacts.update({
+                "skillId": skill_id,
+                "skillName": skill_name,
+                "totalRecords": total_records,
+                "freshRecords": fresh_records,
+                "finalizedRecords": finalized_records,
+                "retriedRecords": retried_records,
+                "Exhausted": is_exhausted
+            })
+
+        if skill_found:
+            suppression_class_count = 0
+            unsuccessful_class_count = 0
+
+            for contact in contact_records:
+                contact_data = {k: v for k, v in contact.items() if k not in ['destinations', 'otherFields']}
+                other_fields = contact.get('otherFields', [])
+                SystemClassification = contact.get('icSystemClassificationName', "")
+
+                if SystemClassification in ['Webservice Suppression', 'Invalid Number']:
+                    suppression_class_count += 1
+                elif SystemClassification in ['No Answer', 'Answering Machine', 'Answering Machine Left Message', 'Busy', 'Error', 'ISDN Cause Code 18']:
+                    unsuccessful_class_count += 1
+
+                for field in other_fields:
+                    contact_data[field['fieldName']] = field['fieldValue']
+                    
+                external_id = contact.get("externalId", "")
+                if "-" in external_id:
+                    external_id_parts = external_id.split("-")
+                    contact_data["externalId"] = external_id_parts[0]
+                    contact_data["attempt"] = int(external_id_parts[1])
+                else:
+                    contact_data["attempt"] = 0     
+                formatted_contacts["contactRecords"].append(contact_data)
+            
+            contactedRecords = finalized_records - suppression_class_count - unsuccessful_class_count
+            formatted_contacts["suppressedRecords"] = suppression_class_count
+            formatted_contacts["unsuccessfulRecords"] = unsuccessful_class_count
+            formatted_contacts["contactedRecords"] = contactedRecords
+
+        # Append formatted contacts for this list to the main list
+        dialer_list.append(formatted_contacts)
+
+    else:
+        logging.error(f"Failed to fetch data for list {id}. Status code: {dialerlst_response.status_code}")
+
+############################## Create Dialer List Summary ##############################
+dialer_summary = []
+
+for item in dialer_list:
+    summary_item = {key: value for key, value in item.items() if key != 'contactRecords'}
+    dialer_summary.append(summary_item)
+
+############################## Check Previous Day List For Update ##############################
+
+connection_string = client.get_secret("azure-connection-string").value
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+summary_container = "summary"
+container_client = blob_service_client.get_container_client(summary_container)
+
+# Calculate previous day's timestamp for filtering
+prev_day_timestamp = (datetime.now() - timedelta(days=1)).strftime("%m%d%Y")
+prev_day_listids = [list_item['listId'] for list_item in dialer_summary 
+                    if datetime.strptime(list_item['createDate'], "%Y-%m-%d %H:%M:%S").date() == (datetime.now() - timedelta(days=1)).date()]
+
+# Optimized retrieval of latest summary blob
+latest_summary_blob = None
+latest_modified_time = None
+
+# List blobs with prefix 'summary' and use metadata
+for blob in container_client.list_blobs(name_starts_with="summary"):
+    # Compare using metadata instead of making additional property calls
+    file_modified_time = blob.last_modified.timestamp()
+    if latest_summary_blob is None or file_modified_time > latest_modified_time:
+        latest_summary_blob = blob.name
+        latest_modified_time = file_modified_time
+
+# Proceed with processing the latest blob, if found
+if latest_summary_blob:
+    logging.info(f"Most recent 'summary' blob found: {latest_summary_blob}, Modified on: {datetime.fromtimestamp(latest_modified_time)}")
+    blob_client = container_client.get_blob_client(latest_summary_blob)
+    summary_data = blob_client.download_blob().readall()
+    previous_summary_data = json.loads(summary_data)
+    previous_list_ids = [item['listId'] for item in previous_summary_data if 'listId' in item]
+
+# Logic for checking and updating list items based on previous data
+for list_item in dialer_summary:
+    if list_item['listId'] in prev_day_listids:
+        matching_old_list = next((item for item in previous_summary_data if item['listId'] == list_item['listId']), None)
+        if matching_old_list:
+            values_to_check = ["totalRecords", "freshRecords", "finalizedRecords", "retriedRecords"]
+            values_changed = any(list_item[key] != matching_old_list.get(key) for key in values_to_check)
+
+            if values_changed:
+                list_item['createDate'] = current_est_time
+                list_item['updateDate'] = current_est_time
+                is_exhausted = is_list_exhausted(
+                    list_item["totalRecords"], list_item["freshRecords"], 
+                    list_item["finalizedRecords"], list_item["retriedRecords"], 
+                    list_item["updateDate"]
+                )
+                list_item['Exhausted'] = is_exhausted
+            else:
+                list_item['updateDate'] = matching_old_list.get('updateDate', list_item['updateDate'])
+                list_item['Exhausted'] = matching_old_list.get('Exhausted', list_item.get('Exhausted'))
+        else:
+            logging.warning(f"No matching entry for listId {list_item['listId']} in previous day's data.")
+
+############################## Save JSON Data ##############################
+connection_string = client.get_secret("azure-connection-string").value
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+summary_container = "summary"
+container_client = blob_service_client.get_container_client(summary_container)
+contacts_container = "contacts"
+contacts_container_client = blob_service_client.get_container_client(contacts_container)
+
+summary_path = f"summary_{timestamp}.json"
+contacts_path = f"dialer_contacts_{timestamp}.json"
+
+def save_json(container_client, data, path):
+    json_data = json.dumps(data, ensure_ascii=False, indent=4)
+    blob_client = container_client.get_blob_client(path)
+    blob_client.upload_blob(json_data, overwrite=True)
+
+# Save data to the respective containers
+save_json(container_client, dialer_summary, summary_path)
+save_json(contacts_container_client, dialer_list, contacts_path)
