@@ -119,10 +119,10 @@ client = SecretClient(vault_url=azure_vault_url, credential=credential)
 jira_client_id = client.get_secret("jira-client-id").value
 jira_client_secret = client.get_secret("jira-client-secret").value
 current_year = datetime.now().year
-base_url = "https://morgan.atlassian.net"
+base_url = os.environ["jira_base_url"]
 lsi_jql = "project = LSI ORDER BY created DESC"
 ccc_jql = "project = CCC ORDER BY created DESC"
-jim_jql = (
+jim_jql = (https://github.com/ForgottenFJ/Portfolio/blob/main/Runbooks/Jira-Ticket-ETL
     'project = JIM AND '
     'status NOT IN ("No longer needed", Done, Duplicate, "On Hold", "Confirmed in Production", "Blocked") '
     'ORDER BY created DESC'
