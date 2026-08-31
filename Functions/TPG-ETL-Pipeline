@@ -91,11 +91,11 @@ def convert(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info("ConvertTPGFile function triggered.")
 
-    container = "tpg-data"
-    source_prefix = "tpg-source/TPG_MorganAndMorgan_"
-    output_folder = "tpg-converted"
-    shards_prefix = "tpg-master/data/"
-    master_path = "tpg-master/TPG_MorganAndMorgan_Master.parquet"
+    container = os.environ["DATA_CONTAINER"]
+    source_prefix = os.environ["SOURCE_PREFIX"]
+    output_folder = os.environ["OUTPUT_FOLDER"]
+    shards_prefix = os.environ["SHARDS_PREFIX"]
+    master_path = os.environ["MASTER_PATH"]
     processed_log_path = "tpg-master/processed_files.txt"
 
     try:
