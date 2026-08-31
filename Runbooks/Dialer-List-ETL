@@ -15,7 +15,7 @@ logging.basicConfig(
     ]
 )
 
-azure_vault_url = 'https://mm-ccc-project-team-kv.vault.azure.net/'
+azure_vault_url = os.environ["azure_vault_url"]
 credential = ManagedIdentityCredential()
 client = SecretClient(vault_url=azure_vault_url, credential=credential)
 eastern = pytz.timezone('America/New_York')
