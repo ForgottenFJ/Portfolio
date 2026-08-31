@@ -48,7 +48,7 @@ cxone_access_key    = client.get_secret("cxone-access-key").value
 cxone_access_secret = client.get_secret("cxone-access-secret").value
 
 director_title   = "Director L and D"
-DIRECTOR_EMAILS = ["efuentes@forthepeople.com", "AHidalgo@ForThePeople.com"]
+DIRECTOR_EMAILS = ["director1@example.com", "director2@example.com"]
 REDDY_PRODUCT_ID = 566   #Social Security
 #REDDY_PRODUCT_ID = 301  #Premise Liability
 
