@@ -18,6 +18,23 @@ REST API integration, data transformation, and analytics workflows.
 - Power BI
 - Pandas
 
+## Data Engineering Patterns
+
+The portfolio includes hands-on experience with:
+
+- ETL/ELT pipeline development
+- SQL-based data transformation
+- Azure Data Factory orchestration
+- Self-hosted Integration Runtime (SHIR)
+- Python-based data processing
+- REST API ingestion
+- Azure Functions
+- Azure Automation Runbooks
+- Azure Blob Storage
+- Azure Key Vault
+- Power BI analytics
+- Production monitoring and error handling
+
 ## Projects
 
 ### Azure Functions
