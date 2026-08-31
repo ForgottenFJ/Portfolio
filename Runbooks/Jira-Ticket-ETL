@@ -120,13 +120,9 @@ jira_client_id = client.get_secret("jira-client-id").value
 jira_client_secret = client.get_secret("jira-client-secret").value
 current_year = datetime.now().year
 base_url = os.environ["jira_base_url"]
-lsi_jql = "project = LSI ORDER BY created DESC"
-ccc_jql = "project = CCC ORDER BY created DESC"
-jim_jql = (https://github.com/ForgottenFJ/Portfolio/blob/main/Runbooks/Jira-Ticket-ETL
-    'project = JIM AND '
-    'status NOT IN ("No longer needed", Done, Duplicate, "On Hold", "Confirmed in Production", "Blocked") '
-    'ORDER BY created DESC'
-)
+lsi_jql = os.environ["lsi_jql"]
+ccc_jql = os.environ["ccc_jql"]
+jim_jql = os.environ["jim_jql"]
 max_results = 100
 auth = HTTPBasicAuth(jira_client_id, jira_client_secret)
 
