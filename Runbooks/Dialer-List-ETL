@@ -1,4 +1,4 @@
-import requests, json, base64, pytz, logging
+import requests, json, base64, pytz, logging, os
 from azure.identity import ManagedIdentityCredential
 from azure.keyvault.secrets import SecretClient
 from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
