@@ -1,0 +1,26 @@
+# Azure Functions local secrets — never commit
+local.settings.json
+host.json.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Env files
+.env
+.env.*
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Azure Functions build artifacts
+bin/
+obj/
+.python_packages/
