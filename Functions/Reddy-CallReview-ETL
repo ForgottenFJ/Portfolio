@@ -49,8 +49,7 @@ cxone_access_secret = client.get_secret("cxone-access-secret").value
 
 director_title   = "Director L and D"
 DIRECTOR_EMAILS = ["director1@example.com", "director2@example.com"]
-REDDY_PRODUCT_ID = 566   #Social Security
-#REDDY_PRODUCT_ID = 301  #Premise Liability
+REDDY_PRODUCT_ID = int(os.environ["PRODUCT_ID"])
 
 EXTRACT_BASE  = "https://api-na1.niceincontact.com/data-extraction/v1/jobs"
 SEGMENT_BASE  = "https://api-na1.niceincontact.com/media-playback/v1/segments"
