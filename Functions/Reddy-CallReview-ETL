@@ -47,7 +47,7 @@ cxone_client_secret = client.get_secret("cxone-client-secret").value
 cxone_access_key    = client.get_secret("cxone-access-key").value
 cxone_access_secret = client.get_secret("cxone-access-secret").value
 
-director_title   = "Director L and D"
+director_title   = "Direct_Title"
 DIRECTOR_EMAILS = ["director1@example.com", "director2@example.com"]
 REDDY_PRODUCT_ID = int(os.environ["PRODUCT_ID"])
 
@@ -57,8 +57,9 @@ POLL_INTERVAL = 5
 POLL_TIMEOUT  = 300
 
 EXCLUDE_DISPOSITIONS = [
-    "Bad Connection", "Left Message", "No Caller on the Line",
-    "Unable to Leave VM", "Transferred Call",
+    "Disposition A",
+    "Disposition B",
+    "Transferred",
 ]
 
 
