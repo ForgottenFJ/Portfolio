@@ -1,4 +1,4 @@
-import requests, logging, pytz, unicodedata, re
+import requests, logging, pytz, unicodedata, re, os
 import pandas as pd
 from io import StringIO
 from requests.auth import HTTPBasicAuth
