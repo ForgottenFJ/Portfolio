@@ -1,0 +1,1678 @@
+import logging, io, os, traceback
+import pandas as pd
+import azure.functions as func
+from io import StringIO
+from datetime import datetime, timedelta
+from azure.identity import DefaultAzureCredential, EnvironmentCredential, ClientSecretCredential
+from azure.keyvault.secrets import SecretClient
+from azure.storage.blob import BlobServiceClient
+import gc
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+app = func.FunctionApp()
+
+
+def last_first_to_first_last(series: pd.Series) -> pd.Series:
+    """Convert 'last, first' format to 'First Last' with proper title casing."""
+    s = (
+        series.fillna("")
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+    )
+
+    has_comma = s.str.contains(",", regex=False)
+    parts = s.str.split(",", n=1, expand=True)
+
+    if parts.shape[1] < 2:
+        parts[1] = ""
+
+    first_last = (
+        parts[1].fillna("").str.strip() + " " + parts[0].fillna("").str.strip()
+    ).str.strip()
+
+    def tidy_case(x: pd.Series) -> pd.Series:
+        x = x.str.title()
+        x = x.str.replace(
+            r"\b(O'|Mc)([a-z])",
+            lambda m: m.group(1) + m.group(2).upper(),
+            regex=True,
+        )
+        return x
+
+    first_last = tidy_case(first_last)
+    first_last = first_last.where(has_comma, tidy_case(s))
+    return first_last
+
+
+# =============================================================================
+# HELPER: Get Blob Service Client
+# =============================================================================
+def get_blob_service_client():
+    """Get authenticated BlobServiceClient using Key Vault credentials."""
+    azure_vault_url = os.environ["azure_vault_url"]
+
+    if os.environ.get("AZURE_FUNCTIONS_ENVIRONMENT") == "Development":
+        logging.info("Using EnvironmentCredential for local development.")
+        credential = EnvironmentCredential()
+    else:
+        logging.info("Using ClientSecretCredential for Azure environment.")
+        tenant_id = os.environ["azure_tenant_id"]
+        client_id = os.environ["azure_client_id"]
+        client_secret = os.environ["azure_client_secret"]
+        credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+
+    client = SecretClient(vault_url=azure_vault_url, credential=credential)
+    connection_string = client.get_secret("azure-connection-string").value
+    return BlobServiceClient.from_connection_string(connection_string)
+
+
+# =============================================================================
+# CONVERT FUNCTION
+# =============================================================================
+@app.function_name(name="ConvertTPGFile")
+@app.route(route="convert", methods=["POST"])
+def convert(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Converts pipe-delimited TPG .txt files to CSV and writes ONLY new
+    dates as a small dated shard under tpg-master/data/.
+    The master parquet is never read or rewritten by this function.
+    Run /api/merge after this to consolidate shards into master,
+    then /api/process to generate output CSVs.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from datetime import date as date_type
+
+    logging.info("ConvertTPGFile function triggered.")
+
+    container = "tpg-data"
+    source_prefix = "tpg-source/TPG_MorganAndMorgan_"
+    output_folder = "tpg-converted"
+    shards_prefix = "tpg-master/data/"
+    master_path = "tpg-master/TPG_MorganAndMorgan_Master.parquet"
+    processed_log_path = "tpg-master/processed_files.txt"
+
+    try:
+        blob_service_client = get_blob_service_client()
+        container_client = blob_service_client.get_container_client(container)
+
+        # =================================================================
+        # LOAD LIST OF ALREADY PROCESSED FILES
+        # =================================================================
+        processed_files = set()
+        try:
+            log_blob_client = container_client.get_blob_client(processed_log_path)
+            log_data = log_blob_client.download_blob().readall().decode("utf-8")
+            processed_files = set(
+                line.strip() for line in log_data.splitlines() if line.strip()
+            )
+            logging.info(f"Found {len(processed_files)} previously processed files")
+        except Exception:
+            logging.info("No processed files log found, will create new")
+
+        # =================================================================
+        # LOAD EXISTING DATES FROM LEGACY MASTER + ANY SHARDS
+        # Only reads the date column from each — never expands full data
+        # =================================================================
+        existing_dates = set()
+
+        # Check legacy master parquet
+        try:
+            master_bytes = container_client.get_blob_client(
+                master_path
+            ).download_blob().readall()
+            dates_only = pq.read_table(
+                io.BytesIO(master_bytes), columns=["Evaluation Date"]
+            ).to_pandas()
+            dates_only["Evaluation Date"] = pd.to_datetime(
+                dates_only["Evaluation Date"], errors="coerce"
+            )
+            existing_dates.update(
+                dates_only["Evaluation Date"].dt.date.dropna().unique()
+            )
+            del master_bytes, dates_only
+            gc.collect()
+            logging.info(
+                f"Legacy master: dates up to "
+                f"{max(existing_dates) if existing_dates else 'none'}"
+            )
+        except Exception:
+            logging.info("No legacy master found")
+
+        # Check any existing shards
+        shard_blobs = [
+            b for b in container_client.list_blobs(name_starts_with=shards_prefix)
+            if b.name.endswith(".parquet") and b.size > 0
+        ]
+        if shard_blobs:
+            logging.info(f"Reading dates from {len(shard_blobs)} existing shards...")
+            for shard_blob in shard_blobs:
+                try:
+                    shard_data = container_client.get_blob_client(
+                        shard_blob.name
+                    ).download_blob().readall()
+                    shard_dates = pq.read_table(
+                        io.BytesIO(shard_data), columns=["Evaluation Date"]
+                    ).to_pandas()
+                    shard_dates["Evaluation Date"] = pd.to_datetime(
+                        shard_dates["Evaluation Date"], errors="coerce"
+                    )
+                    existing_dates.update(
+                        shard_dates["Evaluation Date"].dt.date.dropna().unique()
+                    )
+                    del shard_data, shard_dates
+                    gc.collect()
+                except Exception as e:
+                    logging.warning(
+                        f"Could not read dates from {shard_blob.name}: {e!r}"
+                    )
+
+        logging.info(f"Total existing dates across all sources: {len(existing_dates)}")
+
+        # =================================================================
+        # LOAD USER TABLE FOR EMAIL ENRICHMENT
+        # =================================================================
+        df_users = pd.DataFrame()
+        try:
+            user_container = blob_service_client.get_container_client("master-file")
+            sf_users_data = user_container.get_blob_client(
+                "Salesforce/Users/user_table.csv"
+            ).download_blob().readall()
+            df_users = pd.read_csv(io.StringIO(sf_users_data.decode("utf-8")))
+            df_users["Email"] = df_users["Email"].astype("string").str.lower().str.strip()
+            df_users["Full Name"] = (
+                df_users["FirstName"].fillna("").astype(str).str.strip()
+                + " "
+                + df_users["LastName"].fillna("").astype(str).str.strip()
+            ).str.strip().str.title()
+            logging.info(f"Loaded user table: {len(df_users)} users")
+        except Exception as e:
+            logging.warning(f"Could not load user table for email enrichment: {e!r}")
+
+        # Build the name->email lookup once (reused for every file)
+        name_to_email = {}
+        if not df_users.empty:
+            name_to_email = dict(
+                zip(df_users["Full Name"].str.lower(), df_users["Email"])
+            )
+
+        # =================================================================
+        # FIND UNPROCESSED SOURCE FILES
+        # =================================================================
+        all_blobs = list(container_client.list_blobs(name_starts_with=source_prefix))
+        txt_blobs = [b for b in all_blobs if b.name.endswith(".txt")]
+
+        small_blobs = [b.name for b in txt_blobs if b.size < 1000]
+        if small_blobs:
+            logging.warning(
+                f"Skipping {len(small_blobs)} file(s) under 1KB: {small_blobs}"
+            )
+        txt_blobs = [b for b in txt_blobs if b.size >= 1000]
+
+        if not txt_blobs:
+            logging.warning("No .txt source files found, will check fallback CSVs")
+
+        unprocessed_blobs = [
+            b for b in txt_blobs if b.name.split("/")[-1] not in processed_files
+        ]
+
+        # =================================================================
+        # FALLBACK: Check tpg-converted for CSVs not yet processed
+        # =================================================================
+        converted_prefix = "tpg-converted/TPG_MorganAndMorgan_"
+        all_converted = list(
+            container_client.list_blobs(name_starts_with=converted_prefix)
+        )
+        csv_blobs = [
+            b for b in all_converted if b.name.endswith(".csv") and b.size >= 1000
+        ]
+
+        fallback_blobs = []
+        for cb in csv_blobs:
+            txt_equivalent = cb.name.split("/")[-1].replace(".csv", ".txt")
+            if txt_equivalent not in processed_files:
+                fallback_blobs.append(cb)
+                logging.info(
+                    f"Fallback: found unprocessed CSV {cb.name} (source .txt missing)"
+                )
+
+        if not unprocessed_blobs and not fallback_blobs:
+            return func.HttpResponse(
+                '{"status": "success", "message": "No new files to process"}',
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        unprocessed_blobs.sort(key=lambda b: b.name)
+        logging.info(
+            f"Found {len(unprocessed_blobs)} unprocessed files, "
+            f"{len(fallback_blobs)} fallback CSVs"
+        )
+
+        # =================================================================
+        # PROCESS EACH FILE — COLLECT NEW DATA
+        # =================================================================
+        new_data_frames = []
+        total_rows_added = 0
+        total_dates_added = 0
+        total_emails_filled = 0
+        files_processed = []
+
+        for blob in unprocessed_blobs + fallback_blobs:
+            input_path = blob.name
+            input_filename = input_path.split("/")[-1]
+            is_fallback = input_path.startswith("tpg-converted/")
+            base_name = input_filename.rsplit(".", 1)[0]
+            output_path = f"{output_folder}/{base_name}.csv"
+
+            logging.info(
+                f"{'Fallback' if is_fallback else 'Processing'}: {input_filename}"
+            )
+
+            try:
+                blob_client = container_client.get_blob_client(input_path)
+                blob_data = blob_client.download_blob().readall()
+
+                if is_fallback:
+                    df = pd.read_csv(io.BytesIO(blob_data), encoding="utf-8-sig")
+                else:
+                    df = pd.read_csv(
+                        io.BytesIO(blob_data), delimiter="|", encoding="utf-8"
+                    )
+
+                df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+                df = df.dropna(axis=1, how="all")
+
+                del blob_data
+                gc.collect()
+
+                logging.info(f"Loaded {len(df)} rows, columns: {list(df.columns)}")
+
+                # =========================================================
+                # ENRICH MISSING AgentEmail FROM USER TABLE
+                # Runs on the WHOLE file, BEFORE the date filter, so emails
+                # are filled regardless of whether the dates are new. Also
+                # runs before the CSV copy is saved so the converted CSV
+                # carries the filled emails.
+                # =========================================================
+                file_emails_filled = 0
+                if (
+                    name_to_email
+                    and "AgentEmail" in df.columns
+                    and "Agent" in df.columns
+                ):
+                    missing_email_mask = df["AgentEmail"].isna() | (
+                        df["AgentEmail"].astype(str).str.strip() == ""
+                    )
+                    if missing_email_mask.any():
+                        agent_names_converted = last_first_to_first_last(
+                            df.loc[missing_email_mask, "Agent"]
+                        )
+                        filled_emails = agent_names_converted.str.lower().map(
+                            name_to_email
+                        )
+                        df.loc[missing_email_mask, "AgentEmail"] = filled_emails
+                        file_emails_filled = int(filled_emails.notna().sum())
+                        still_missing = int(
+                            missing_email_mask.sum() - file_emails_filled
+                        )
+                        total_emails_filled += file_emails_filled
+                        logging.info(
+                            f"Filled {file_emails_filled} missing emails from "
+                            f"user table, {still_missing} still missing"
+                        )
+
+                # Save CSV copy (now includes enriched emails)
+                csv_buffer = StringIO()
+                df.to_csv(csv_buffer, index=False)
+                csv_data = csv_buffer.getvalue().encode("utf-8-sig")
+                container_client.get_blob_client(output_path).upload_blob(
+                    csv_data, overwrite=True
+                )
+                del csv_buffer, csv_data
+                gc.collect()
+                logging.info(f"Saved CSV: {output_path}")
+
+                # Parse Evaluation Date
+                eval_date_col = next(
+                    (
+                        c
+                        for c in [
+                            "Evaluation Date", "EVALUATION_DATE", "Evaluation_Date"
+                        ]
+                        if c in df.columns
+                    ),
+                    None,
+                )
+
+                rows_added = 0
+                dates_added = 0
+
+                if eval_date_col:
+                    df["Evaluation Date"] = pd.to_datetime(
+                        df[eval_date_col],
+                        format="%m/%d/%Y %I:%M:%S %p",
+                        errors="coerce",
+                    )
+                    if df["Evaluation Date"].isna().all():
+                        df["Evaluation Date"] = pd.to_datetime(
+                            df[eval_date_col], errors="coerce"
+                        )
+
+                    df["_date_only"] = df["Evaluation Date"].dt.date
+                    file_dates = set(df["_date_only"].dropna().unique())
+                    dates_to_add = file_dates - existing_dates
+
+                    if dates_to_add:
+                        df_to_append = (
+                            df[df["_date_only"].isin(dates_to_add)]
+                            .drop(columns=["_date_only"])
+                            .copy()
+                        )
+
+                        rows_added = len(df_to_append)
+                        dates_added = len(dates_to_add)
+                        new_data_frames.append(df_to_append)
+                        existing_dates.update(dates_to_add)
+                        total_rows_added += rows_added
+                        total_dates_added += dates_added
+                        logging.info(
+                            f"Queued {rows_added} rows for {dates_added} new dates"
+                        )
+                    else:
+                        logging.info("No new dates in this file — skipping")
+
+                del df
+                gc.collect()
+
+                processed_files.add(input_filename.replace(".csv", ".txt"))
+                files_processed.append(
+                    {
+                        "filename": input_filename,
+                        "rows_added": rows_added,
+                        "dates_added": dates_added,
+                        "emails_filled": file_emails_filled,
+                    }
+                )
+
+            except Exception as e:
+                logging.error(f"Error processing {input_filename}: {e!r}")
+                logging.error(traceback.format_exc())
+                continue
+
+        # =================================================================
+        # WRITE NEW DATA AS A SMALL DATED SHARD ONLY
+        # Never reads or rewrites the master or any existing shard
+        # Peak RAM = only the new rows (~1.7M rows, not 11.8M)
+        # =================================================================
+        shard_rows = 0
+
+        if new_data_frames:
+            logging.info(f"Combining {len(new_data_frames)} new DataFrames...")
+            new_combined = pd.concat(new_data_frames, ignore_index=True)
+            del new_data_frames
+            gc.collect()
+            logging.info(f"New data: {len(new_combined)} rows")
+
+            # Cast object columns to string
+            for col in new_combined.columns:
+                if new_combined[col].dtype == object:
+                    new_combined[col] = (
+                        new_combined[col]
+                        .astype(str)
+                        .replace("nan", "")
+                        .replace("<NA>", "")
+                    )
+
+            new_table = pa.Table.from_pandas(new_combined, preserve_index=False)
+            shard_rows = new_table.num_rows
+            del new_combined
+            gc.collect()
+            logging.info(f"New Arrow table: {shard_rows} rows")
+
+            # Write only new rows as a dated shard — named by today's date
+            shard_name = (
+                f"{shards_prefix}"
+                f"part-{date_type.today().strftime('%Y-%m-%d')}.parquet"
+            )
+            parquet_buffer = io.BytesIO()
+            pq.write_table(new_table, parquet_buffer, compression="snappy")
+            parquet_buffer.seek(0)
+            del new_table
+            gc.collect()
+
+            container_client.get_blob_client(shard_name).upload_blob(
+                parquet_buffer, overwrite=True
+            )
+            logging.info(f"New shard uploaded: {shard_name} ({shard_rows} rows)")
+
+        else:
+            logging.info("No new data to write")
+
+        # =================================================================
+        # SAVE PROCESSED FILES LOG
+        # =================================================================
+        log_content = "\n".join(sorted(processed_files))
+        container_client.get_blob_client(processed_log_path).upload_blob(
+            log_content.encode("utf-8"), overwrite=True
+        )
+
+        import json
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "success",
+                    "files_processed": len(files_processed),
+                    "total_rows_added": total_rows_added,
+                    "total_dates_added": total_dates_added,
+                    "total_emails_filled": total_emails_filled,
+                    "shard_rows_written": shard_rows,
+                    "details": files_processed,
+                }
+            ),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        logging.error("Error in ConvertTPGFile: %s", repr(e), exc_info=True)
+        logging.error(traceback.format_exc())
+        return func.HttpResponse(
+            f'{{"error": "{str(e)}"}}',
+            status_code=500,
+            mimetype="application/json",
+        )
+
+# =============================================================================
+# MERGE FUNCTION
+# =============================================================================
+@app.function_name(name="MergeTPGMaster")
+@app.route(route="merge", methods=["POST"])
+def merge(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Combines all parquet shards in tpg-master/data/ into a single
+    consolidated master parquet.
+
+    Safety rules:
+    1. The existing master is ALWAYS downloaded first and included
+       as a shard — it is never lost even if no data/ shards exist.
+    2. Each shard is read, cast, and written individually — peak RAM
+       is one shard at a time, not the full combined table.
+    3. All large_string columns are cast to string for consistency.
+    4. The new master is written to staging first.
+    5. A confirmed server-side copy promotes staging → master.
+    6. Staging and shards are deleted only after confirmed copy.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import tempfile
+    import pathlib
+    import time
+
+    logging.info("MergeTPGMaster function triggered.")
+
+    container = "tpg-data"
+    shards_prefix = "tpg-master/data/"
+    master_path = "tpg-master/TPG_MorganAndMorgan_Master.parquet"
+    staging_path = "tpg-master/TPG_MorganAndMorgan_Master_staging.parquet"
+
+    try:
+        blob_service_client = get_blob_service_client()
+        container_client = blob_service_client.get_container_client(container)
+
+        # Find all new shards
+        shard_blobs = [
+            b for b in container_client.list_blobs(name_starts_with=shards_prefix)
+            if b.name.endswith(".parquet") and b.size > 0
+        ]
+
+        if not shard_blobs:
+            return func.HttpResponse(
+                '{"status": "success", "message": "No new shards found to merge"}',
+                status_code=200,
+                mimetype="application/json",
+            )
+
+        logging.info(f"Found {len(shard_blobs)} new shard(s) to merge")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            shard_dir = tmp / "shards"
+            shard_dir.mkdir()
+
+            shard_index = 0
+
+            # =============================================================
+            # STEP 1: Download existing master FIRST as shard 0
+            # This ensures the master is always preserved in the merge
+            # =============================================================
+            master_included = False
+            try:
+                logging.info("Downloading existing master as base shard...")
+                master_data = (
+                    container_client.get_blob_client(master_path)
+                    .download_blob()
+                    .readall()
+                )
+                master_size_mb = len(master_data) / 1024 / 1024
+                with open(shard_dir / f"part-{shard_index:04d}.parquet", "wb") as f:
+                    f.write(master_data)
+                del master_data
+                gc.collect()
+                master_included = True
+                shard_index += 1
+                logging.info(
+                    f"Existing master downloaded as base shard "
+                    f"({master_size_mb:.1f} MB)"
+                )
+            except Exception as e:
+                logging.warning(
+                    f"No existing master found (first run?): {e!r} — "
+                    f"merging new shards only"
+                )
+
+            # =============================================================
+            # STEP 2: Download all new shards
+            # =============================================================
+            for i, blob in enumerate(shard_blobs):
+                logging.info(
+                    f"Downloading shard {i + 1}/{len(shard_blobs)}: {blob.name}"
+                )
+                shard_data = (
+                    container_client.get_blob_client(blob.name)
+                    .download_blob()
+                    .readall()
+                )
+                with open(
+                    shard_dir / f"part-{shard_index:04d}.parquet", "wb"
+                ) as f:
+                    f.write(shard_data)
+                del shard_data
+                gc.collect()
+                shard_index += 1
+
+            total_shards = shard_index
+            logging.info(
+                f"Total shards to merge: {total_shards} "
+                + (f"(1 master + {len(shard_blobs)} new)" if master_included
+                   else f"({len(shard_blobs)} new shards only)")
+            )
+
+            # =============================================================
+            # STEP 3: Build unified schema — cast all large_string to string
+            # Read schemas only (no data) to determine types
+            # =============================================================
+            files = sorted(shard_dir.glob("*.parquet"))
+
+            logging.info("Reading shard schemas for unification...")
+            schemas = [pq.read_schema(f) for f in files]
+
+            # Use first schema as base, cast large_string → string everywhere
+            # Build unified schema: if a column has conflicting types across shards,
+            # cast to string as the safe common type.
+            col_types: dict[str, pa.DataType] = {}
+            for schema in schemas:
+                for field in schema:
+                    t = field.type
+                    # Normalize large_string → string, large_binary → binary
+                    if t == pa.large_string():
+                        t = pa.string()
+                    elif t == pa.large_binary():
+                        t = pa.binary()
+                    if field.name not in col_types:
+                        col_types[field.name] = t
+                    elif col_types[field.name] != t:
+                        # Type conflict across shards — fall back to string
+                        logging.warning(
+                            f"Type conflict for '{field.name}': "
+                            f"{col_types[field.name]} vs {t} — casting to string"
+                        )
+                        col_types[field.name] = pa.string()
+
+            unified_fields = [pa.field(name, dtype) for name, dtype in col_types.items()]
+            unified_schema = pa.schema(unified_fields)
+            logging.info(f"Unified schema ({len(unified_schema)} cols): "
+                + ", ".join(f"{field.name}:{field.type}" for field in unified_schema))
+
+            # Determine common columns across all shards
+            all_col_sets = [set(s.names) for s in schemas]
+            common_cols = sorted(set.intersection(*all_col_sets))
+            # Filter unified_schema to common columns only
+            unified_schema = pa.schema(
+                [unified_schema.field(c) for c in common_cols
+                 if unified_schema.get_field_index(c) >= 0]
+            )
+
+            logging.info(
+                f"Unified schema: {len(unified_schema)} columns, "
+                f"common across all shards"
+            )
+
+            # =============================================================
+            # STEP 4: Write each shard individually into output parquet
+            # Peak RAM = one shard at a time, not the full combined table
+            # =============================================================
+            output_parquet = tmp / "merged.parquet"
+            total_rows = 0
+
+            with pq.ParquetWriter(
+                output_parquet,
+                unified_schema,
+                compression="snappy",
+                use_dictionary=True,
+                write_statistics=False,
+            ) as writer:
+                for f in files:
+                    logging.info(f"Writing shard: {f.name}")
+                    shard_rows = 0
+
+                    # Use ParquetFile to stream row groups — never loads full shard
+                    parquet_file = pq.ParquetFile(f)
+                    num_row_groups = parquet_file.metadata.num_row_groups
+                    logging.info(f"  {num_row_groups} row groups in {f.name}")
+
+                    for rg in range(num_row_groups):
+                        batch_table = parquet_file.read_row_group(rg, columns=common_cols)
+
+                        # Cast columns to match unified schema types
+                        cast_cols = []
+                        for col_name in unified_schema.names:
+                            col = batch_table.column(col_name)
+                            target_type = unified_schema.field(col_name).type
+                            if col.type != target_type:
+                                try:
+                                    col = col.cast(target_type, safe=False)
+                                except Exception as cast_err:
+                                    logging.warning(
+                                        f"  Cast failed for '{col_name}': "
+                                        f"{cast_err!r} — using string"
+                                    )
+                                    col = col.cast(pa.string(), safe=False)
+                            cast_cols.append(col)
+
+                        batch_table = pa.table(
+                            {
+                                name: cast_cols[i]
+                                for i, name in enumerate(unified_schema.names)
+                            }
+                        )
+
+                        for batch in batch_table.to_batches(max_chunksize=50_000):
+                            writer.write_batch(batch)
+
+                        shard_rows += len(batch_table)
+                        total_rows += len(batch_table)
+                        del batch_table, cast_cols
+                        gc.collect()
+
+                    logging.info(
+                        f"Shard {f.name} written "
+                        f"({shard_rows:,} rows, running total: {total_rows:,})"
+                    )
+
+            file_size_mb = output_parquet.stat().st_size / 1024 / 1024
+            logging.info(
+                f"Merged parquet written: {total_rows:,} rows, "
+                f"{file_size_mb:.1f} MB"
+            )
+
+            # =============================================================
+            # STEP 5: Upload to staging first — never touch master yet
+            # =============================================================
+            logging.info("Uploading merged parquet to staging...")
+            with open(output_parquet, "rb") as f:
+                container_client.get_blob_client(staging_path).upload_blob(
+                    f, overwrite=True, max_concurrency=4
+                )
+            logging.info("Staging upload complete — promoting to master...")
+
+            # =============================================================
+            # STEP 6: Server-side copy staging → master
+            # Wait for confirmed success before proceeding
+            # =============================================================
+            master_blob = container_client.get_blob_client(master_path)
+            staging_blob = container_client.get_blob_client(staging_path)
+            master_blob.start_copy_from_url(staging_blob.url)
+
+            for _ in range(60):
+                props = master_blob.get_blob_properties()
+                copy_status = props.copy.status
+                if copy_status == "success":
+                    break
+                elif copy_status == "failed":
+                    raise RuntimeError(
+                        f"Blob copy failed: {props.copy.status_description}"
+                    )
+                logging.info(f"  Copy status: {copy_status} — waiting...")
+                time.sleep(2)
+            else:
+                raise RuntimeError("Blob copy timed out after 120 seconds")
+
+            logging.info("Master promoted from staging")
+
+            # =============================================================
+            # STEP 7: Clean up staging and shards ONLY after confirmed copy
+            # =============================================================
+            staging_blob.delete_blob()
+            logging.info("Staging blob deleted")
+
+            for blob in shard_blobs:
+                container_client.get_blob_client(blob.name).delete_blob()
+                logging.info(f"Deleted merged shard: {blob.name}")
+
+            logging.info(
+                f"Merge complete — master now has {total_rows:,} rows "
+                f"({file_size_mb:.1f} MB)"
+            )
+
+        import json
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "success",
+                    "shards_merged": len(shard_blobs),
+                    "master_included": master_included,
+                    "total_rows": total_rows,
+                    "output_size_mb": round(file_size_mb, 1),
+                }
+            ),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        logging.error("Error in MergeTPGMaster: %s", repr(e), exc_info=True)
+        logging.error(traceback.format_exc())
+        return func.HttpResponse(
+            f'{{"error": "{str(e)}"}}',
+            status_code=500,
+            mimetype="application/json",
+        )
+
+# =============================================================================
+# PROCESS FUNCTION
+# =============================================================================
+@app.function_name(name="ProcessTPGData")
+@app.route(route="process", methods=["POST"])
+def process(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Append-only process function.
+    1. Downloads existing output CSVs to find already-processed dates
+    2. Loads ONLY unprocessed dates from the master parquet (row-group aware,
+       no fixed time window — driven by what dates are actually missing)
+    3. Processes just the new rows
+    4. Appends new results to existing CSVs and re-uploads
+
+    Peak RAM = new rows only, not the full historical dataset.
+    """
+    try:
+        logging.info("Process-TPG-Data function triggered.")
+
+        import pyarrow.parquet as pq
+        import pyarrow as pa
+
+        # =================================================================
+        # HELPERS
+        # =================================================================
+        def save_csv(container_client, df, path, float_fmt="%.2f"):
+            csv_buffer = StringIO()
+            df.to_csv(csv_buffer, index=False, float_format=float_fmt)
+            csv_data = csv_buffer.getvalue().encode("utf-8-sig")
+            container_client.get_blob_client(path).upload_blob(csv_data, overwrite=True)
+            logging.info(f"Saved {path} ({len(df)} rows)")
+            del csv_buffer, csv_data
+            gc.collect()
+
+        def load_existing_csv(container_client, path, date_col="Date"):
+            """Download existing CSV; return (df, set_of_dates). Empty df on miss."""
+            try:
+                data = container_client.get_blob_client(path).download_blob().readall()
+                df = pd.read_csv(io.StringIO(data.decode("utf-8-sig")))
+                del data
+                dates = set(
+                    pd.to_datetime(df[date_col], errors="coerce")
+                    .dt.date.dropna().unique()
+                )
+                logging.info(
+                    f"Loaded {path}: {len(df)} rows, {len(dates)} dates "
+                    f"(up to {max(dates) if dates else 'none'})"
+                )
+                return df, dates
+            except Exception as e:
+                logging.warning(f"Could not load {path}: {e!r} — starting fresh")
+                return pd.DataFrame(), set()
+
+        def load_master_rows_for_dates(tpg_bytes: bytes, target_dates: set, required_cols: list) -> pd.DataFrame:
+            """
+            Memory-efficient row-group scan of the master parquet.
+            Skips row groups whose max Evaluation Date < earliest target date.
+            Never uses pushdown filters (column is stored as string).
+            Returns a DataFrame containing only rows whose date is in target_dates.
+            """
+            earliest = min(target_dates)
+            parquet_file = pq.ParquetFile(io.BytesIO(tpg_bytes))
+            num_rg = parquet_file.metadata.num_row_groups
+            logging.info(
+                f"Scanning {num_rg} row groups for {len(target_dates)} target dates "
+                f"(earliest: {earliest})"
+            )
+
+            kept = []
+            for rg in range(num_rg):
+                # Cheap pre-check: date column only
+                dates_col = (
+                    parquet_file.read_row_group(rg, columns=["Evaluation Date"])
+                    .to_pandas()["Evaluation Date"]
+                )
+                dates_parsed = pd.to_datetime(dates_col, errors="coerce").dropna()
+                del dates_col
+
+                if dates_parsed.empty or dates_parsed.max().date() < earliest:
+                    logging.info(
+                        f"  RG {rg}: max={dates_parsed.max().date() if not dates_parsed.empty else 'empty'} "
+                        f"< {earliest}, skipping"
+                    )
+                    del dates_parsed
+                    gc.collect()
+                    continue
+
+                # Full read for overlapping row groups
+                batch = parquet_file.read_row_group(rg, columns=required_cols).to_pandas()
+                batch["Evaluation Date"] = pd.to_datetime(batch["Evaluation Date"], errors="coerce")
+                batch = batch.dropna(subset=["Evaluation Date"])
+                batch["Date"] = batch["Evaluation Date"].dt.date
+                batch = batch[batch["Date"].isin(target_dates)].copy()
+
+                if not batch.empty:
+                    logging.info(f"  RG {rg}: kept {len(batch)} rows")
+                    kept.append(batch)
+
+                del dates_parsed, batch
+                gc.collect()
+
+            if not kept:
+                return pd.DataFrame()
+
+            result = pd.concat(kept, ignore_index=True)
+            del kept
+            gc.collect()
+            logging.info(f"Total rows loaded: {len(result)}")
+            return result
+
+        # =================================================================
+        # STEP 1: Blob clients
+        # =================================================================
+        blob_service_client = get_blob_service_client()
+        container_client      = blob_service_client.get_container_client("tpg-data")
+        storage_container     = blob_service_client.get_container_client("centrical-data")
+        scorecard_container   = blob_service_client.get_container_client("master-file")
+        ccc_container         = blob_service_client.get_container_client("ccc-data")
+        user_container        = blob_service_client.get_container_client("master-file")
+
+        # Warn if unmerged shards exist
+        shard_blobs = list(container_client.list_blobs(name_starts_with="tpg-master/data/"))
+        if shard_blobs:
+            logging.warning(
+                f"{len(shard_blobs)} unmerged shard(s) found — "
+                f"run /api/merge before /api/process to include latest data"
+            )
+
+        # =================================================================
+        # STEP 2: Find dates already fully processed across all outputs
+        # =================================================================
+        existing_agent_df,     agent_dates     = load_existing_csv(storage_container,   "TPG/CENTRICAL_TPG.csv")
+        existing_scorecard_df, scorecard_dates = load_existing_csv(scorecard_container, "Scorecard/CENTRICAL_TPG.csv")
+        existing_manager_df,   manager_dates   = load_existing_csv(storage_container,   "TPG/CENTRICAL_TPG_MANAGER.csv")
+        existing_report_df,    report_dates    = load_existing_csv(ccc_container,        "Peter/TPG_REPORT.csv", date_col="Date")
+
+        already_processed = agent_dates & scorecard_dates & manager_dates & report_dates
+        logging.info(f"Dates already fully processed: {len(already_processed)}")
+
+        # =================================================================
+        # STEP 3: Download master parquet; find unprocessed dates
+        # =================================================================
+        logging.info("Downloading master parquet...")
+        tpg_bytes = (
+            container_client
+            .get_blob_client("tpg-master/TPG_MorganAndMorgan_Master.parquet")
+            .download_blob()
+            .readall()
+        )
+
+        # Read date column only to determine what's available
+        all_dates_df = pq.read_table(
+            io.BytesIO(tpg_bytes), columns=["Evaluation Date"]
+        ).to_pandas()
+        all_dates_df["Evaluation Date"] = pd.to_datetime(
+            all_dates_df["Evaluation Date"], errors="coerce"
+        )
+        all_master_dates = set(
+            all_dates_df["Evaluation Date"].dt.date.dropna().unique()
+        )
+        del all_dates_df
+        gc.collect()
+
+        new_dates = all_master_dates - already_processed
+        logging.info(
+            f"Master has {len(all_master_dates)} dates, "
+            f"{len(new_dates)} unprocessed"
+        )
+
+        if not new_dates:
+            del tpg_bytes
+            logging.info("All dates already processed — nothing to do")
+            return func.HttpResponse(
+                "Process completed — no new dates to process.",
+                status_code=200
+            )
+
+        # =================================================================
+        # STEP 4: Load only rows for unprocessed dates (row-group scan)
+        # =================================================================
+        REQUIRED_COLS = [
+            "Evaluation Date", "Agent", "AgentEmail", "Supervisor",
+            "Behavior Text", "Response", "IsDefect", "IsOpportunity",
+            "Evaluation Id",
+        ]
+
+        tpg_df = load_master_rows_for_dates(tpg_bytes, new_dates, REQUIRED_COLS)
+        del tpg_bytes
+        gc.collect()
+
+        if tpg_df.empty:
+            logging.info("No rows found for unprocessed dates — nothing to do")
+            return func.HttpResponse(
+                "Process completed — no rows found for unprocessed dates.",
+                status_code=200
+            )
+
+        logging.info(
+            f"Loaded {len(tpg_df)} rows across "
+            f"{tpg_df['Date'].nunique()} dates"
+        )
+
+        # =================================================================
+        # STEP 5: Load SF users for manager mapping
+        # =================================================================
+        sf_users_data = (
+            user_container
+            .get_blob_client("Salesforce/Users/user_table.csv")
+            .download_blob()
+            .readall()
+        )
+        df_users = pd.read_csv(io.StringIO(sf_users_data.decode("utf-8")))
+        del sf_users_data
+        gc.collect()
+
+        df_users["Email"] = df_users["Email"].astype("string").str.lower().str.strip()
+
+        manager_email_col = (
+            "Manager Email" if "Manager Email" in df_users.columns
+            else "PrimaryManagerEmail"
+        )
+        df_users[manager_email_col] = (
+            df_users[manager_email_col].astype("string").str.lower().str.strip()
+        )
+
+        manager_map = (
+            df_users[["Email", manager_email_col]]
+            .dropna(subset=[manager_email_col])
+            .copy()
+        )
+        if manager_email_col != "Manager Email":
+            manager_map = manager_map.rename(columns={manager_email_col: "Manager Email"})
+
+        email_to_manager = {
+            k: v for k, v in
+            zip(df_users["Email"], df_users[manager_email_col])
+            if pd.notna(v) and v != ""
+        }
+
+        # =================================================================
+        # STEP 6: Clean and prepare tpg_df
+        # =================================================================
+        rename_map = {
+            "EVALUATION_DATE": "Evaluation Date",
+            "AGENT":           "Agent",
+            "AGENTEMAIL":      "AgentEmail",
+            "SUPERVISOR":      "Supervisor",
+            "BEHAVIOR_TEXT":   "Behavior Text",
+            "RESPONSE":        "Response",
+            "ISOPPORTUNITY":   "IsOpportunity",
+            "ISDEFECT":        "IsDefect",
+        }
+        tpg_df = tpg_df.rename(columns=rename_map)
+        if "Behavior Text" not in tpg_df.columns and "BEHAVIOR_EXT" in tpg_df.columns:
+            tpg_df = tpg_df.rename(columns={"BEHAVIOR_EXT": "Behavior Text"})
+        tpg_df = tpg_df.loc[:, ~tpg_df.columns.duplicated()]
+
+        tpg_df[["IsDefect", "IsOpportunity"]] = (
+            tpg_df[["IsDefect", "IsOpportunity"]]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0)
+        )
+
+        logging.info(
+            f"Processing {len(tpg_df)} rows across "
+            f"{tpg_df['Date'].nunique()} dates"
+        )
+
+        # =================================================================
+        # STEP 7: Behavior calculations
+        # =================================================================
+        target_behaviors = [
+            "Builds rapport by engaging customer",
+            "Confirms customer's satisfaction with call outcome",
+            "Maintains call control to guide conversation",
+            "Personalizes call by using customer's name",
+            "Takes ownership & displays willingness to help",
+        ]
+
+        behavior_prefix_map = {
+            "Builds rapport by engaging customer":                  "Builds_rapport",
+            "Confirms customer's satisfaction with call outcome":   "Confirms_customer",
+            "Maintains call control to guide conversation":         "Maintains_call",
+            "Personalizes call by using customer's name":           "Personalizes_call",
+            "Takes ownership & displays willingness to help":       "Takes_ownership",
+        }
+
+        filtered_df = tpg_df[tpg_df["Behavior Text"].isin(target_behaviors)].copy()
+
+        behavior_stats = (
+            filtered_df
+            .groupby(["Date", "Agent", "Behavior Text"], as_index=False, observed=True)
+            .agg({"IsDefect": "sum", "IsOpportunity": "sum"})
+        )
+        behavior_stats["DefectRate_raw"] = (
+            behavior_stats["IsDefect"]
+            / behavior_stats["IsOpportunity"].replace(0, float("nan"))
+        ).fillna(0)
+        behavior_stats["DefectRate"] = behavior_stats["DefectRate_raw"].round(2)
+
+        behavior_pivot = (
+            behavior_stats
+            .pivot_table(
+                index=["Date", "Agent"], columns="Behavior Text",
+                values="DefectRate", aggfunc="first", observed=True,
+            ).round(2).reset_index()
+        )
+
+        behavior_pivot_4dec = (
+            behavior_stats
+            .pivot_table(
+                index=["Date", "Agent"], columns="Behavior Text",
+                values="DefectRate_raw", aggfunc="first", observed=True,
+            ).round(4).reset_index()
+        )
+
+        behavior_opp_pivot = (
+            behavior_stats
+            .pivot_table(
+                index=["Date", "Agent"], columns="Behavior Text",
+                values="IsOpportunity", aggfunc="sum", observed=True,
+            ).reset_index()
+            .rename(columns={
+                b: f"{behavior_prefix_map[b]}_IsOpportunity"
+                for b in target_behaviors if b in behavior_stats["Behavior Text"].unique()
+            })
+        )
+
+        behavior_defect_pivot = (
+            behavior_stats
+            .pivot_table(
+                index=["Date", "Agent"], columns="Behavior Text",
+                values="IsDefect", aggfunc="sum", observed=True,
+            ).reset_index()
+            .rename(columns={
+                b: f"{behavior_prefix_map[b]}_IsDefect"
+                for b in target_behaviors if b in behavior_stats["Behavior Text"].unique()
+            })
+        )
+
+        behaviors_totals = (
+            filtered_df
+            .groupby(["Date", "Agent"], as_index=False, observed=True)
+            .agg({"IsDefect": "sum", "IsOpportunity": "sum"})
+            .rename(columns={
+                "IsDefect":     "Behaviors_IsDefect",
+                "IsOpportunity":"Behaviors_IsOpportunity",
+            })
+        )
+        behaviors_totals["Focused_DefectRate"] = (
+            behaviors_totals["Behaviors_IsDefect"]
+            / behaviors_totals["Behaviors_IsOpportunity"].replace(0, float("nan"))
+        ).fillna(0).round(4)
+
+        del filtered_df
+        gc.collect()
+        logging.info("Behaviors calculated")
+
+        # =================================================================
+        # STEP 8: Totals per Date x Agent
+        # =================================================================
+        eval_counts = (
+            tpg_df
+            .groupby(["Date", "Agent"], observed=True)["Evaluation Id"]
+            .nunique()
+            .reset_index(name="Total_Eval")
+        )
+
+        totals = (
+            tpg_df
+            .groupby(["Date", "Agent"], as_index=False, observed=True)
+            .agg({"IsDefect": "sum", "IsOpportunity": "sum"})
+        )
+        totals["DefectRate"] = (
+            totals["IsDefect"] / totals["IsOpportunity"].replace(0, float("nan"))
+        ).fillna(0).round(2)
+        totals["DefectRate_4dec"] = (
+            totals["IsDefect"] / totals["IsOpportunity"].replace(0, float("nan"))
+        ).fillna(0).round(4)
+        totals = totals.rename(columns={
+            "IsDefect":     "IsDefect_Sum",
+            "IsOpportunity":"IsOpportunity_Sum",
+        })
+        totals = totals.merge(eval_counts, on=["Date", "Agent"], how="left")
+        del eval_counts
+        gc.collect()
+        logging.info("Totals calculated")
+
+        # =================================================================
+        # STEP 9: Delight
+        # =================================================================
+        delight_df = tpg_df[
+            tpg_df["Behavior Text"] == "Customer demeanor at end of call"
+        ][["Date", "Agent", "Response"]].copy()
+
+        # =================================================================
+        # STEP 10: Agent info + name→email map; free tpg_df
+        # =================================================================
+        agent_info = (
+            tpg_df
+            .groupby(["Date", "Agent"], observed=True)
+            .agg({"Evaluation Date": "max", "AgentEmail": "first", "Supervisor": "first"})
+            .reset_index()
+        )
+        agent_info["Evaluation Date"] = (
+            pd.to_datetime(agent_info["Evaluation Date"])
+            .dt.strftime("%Y-%m-%d %H:%M:%S")
+        )
+
+        agent_name_to_email_dict = dict(zip(
+            tpg_df["Agent"],
+            tpg_df["AgentEmail"].astype("string").str.lower().str.strip(),
+        ))
+
+        del tpg_df
+        gc.collect()
+        logging.info("tpg_df freed")
+
+        # Delight calculations
+        delight_df["Response"] = delight_df["Response"].astype(str).str.strip()
+        if not delight_df.empty:
+            delight_counts = (
+                delight_df
+                .groupby(["Date", "Agent", "Response"], dropna=False, observed=True)
+                .size()
+                .unstack("Response", fill_value=0)
+                .reset_index()
+            )
+            for col in ["Audibly happy", "Neutral", "Irate"]:
+                if col not in delight_counts.columns:
+                    delight_counts[col] = 0
+            denom = (
+                delight_counts[["Audibly happy", "Neutral", "Irate"]]
+                .sum(axis=1).replace(0, float("nan"))
+            )
+            delight_counts["Delight"]      = (delight_counts["Audibly happy"] / denom).fillna(0).round(3)
+            delight_counts["Delight_4dec"] = (delight_counts["Audibly happy"] / denom).fillna(0).round(4)
+            delight_counts["Audibly_Happy_Sum"]    = delight_counts["Audibly happy"]
+            delight_counts["Delight_Response_Sum"] = denom.fillna(0).astype(int)
+            delight_counts = delight_counts[[
+                "Date", "Agent", "Delight", "Delight_4dec",
+                "Audibly_Happy_Sum", "Delight_Response_Sum",
+            ]]
+        else:
+            delight_counts = pd.DataFrame(columns=[
+                "Date", "Agent", "Delight", "Delight_4dec",
+                "Audibly_Happy_Sum", "Delight_Response_Sum",
+            ])
+        gc.collect()
+        logging.info("Delight calculated")
+
+        # =================================================================
+        # STEP 11: Build agent output
+        # =================================================================
+        new_agent_df = (
+            agent_info
+            .merge(behavior_pivot,        on=["Date", "Agent"], how="left")
+            .merge(behavior_opp_pivot,    on=["Date", "Agent"], how="left")
+            .merge(behavior_defect_pivot, on=["Date", "Agent"], how="left")
+            .merge(totals,                on=["Date", "Agent"], how="left")
+            .merge(behaviors_totals,      on=["Date", "Agent"], how="left")
+            .merge(delight_counts,        on=["Date", "Agent"], how="left")
+        )
+        num_cols = new_agent_df.select_dtypes(include=["float64", "int64"]).columns
+        new_agent_df[num_cols] = new_agent_df[num_cols].fillna(0)
+        new_agent_df = new_agent_df.sort_values(["Date", "Agent"])
+        new_agent_df = new_agent_df.rename(columns={"AgentEmail": "Email"})
+        new_agent_df["Email"] = new_agent_df["Email"].astype("string").str.lower().str.strip()
+        new_agent_df = new_agent_df.merge(manager_map, on="Email", how="left")
+
+        agent_ordered_cols = [
+            "Date", "Email", "Manager Email",
+            "Builds rapport by engaging customer",
+            "Builds_rapport_IsOpportunity", "Builds_rapport_IsDefect",
+            "Confirms customer's satisfaction with call outcome",
+            "Confirms_customer_IsOpportunity", "Confirms_customer_IsDefect",
+            "Maintains call control to guide conversation",
+            "Maintains_call_IsOpportunity", "Maintains_call_IsDefect",
+            "Personalizes call by using customer's name",
+            "Personalizes_call_IsOpportunity", "Personalizes_call_IsDefect",
+            "Takes ownership & displays willingness to help",
+            "Takes_ownership_IsOpportunity", "Takes_ownership_IsDefect",
+            "Behaviors_IsOpportunity", "Behaviors_IsDefect", "Focused_DefectRate",
+            "IsOpportunity_Sum", "IsDefect_Sum", "DefectRate", "Delight",
+        ]
+        new_agent_df = new_agent_df.reindex(columns=agent_ordered_cols)
+        logging.info(f"New agent rows: {len(new_agent_df)}")
+
+        # =================================================================
+        # STEP 12: Build scorecard output
+        # =================================================================
+        new_scorecard_df = (
+            agent_info
+            .merge(behavior_pivot,        on=["Date", "Agent"], how="left")
+            .merge(behavior_opp_pivot,    on=["Date", "Agent"], how="left")
+            .merge(behavior_defect_pivot, on=["Date", "Agent"], how="left")
+            .merge(totals,                on=["Date", "Agent"], how="left")
+            .merge(behaviors_totals,      on=["Date", "Agent"], how="left")
+            .merge(delight_counts,        on=["Date", "Agent"], how="left")
+        )
+        num_cols_sc = new_scorecard_df.select_dtypes(include=["float64", "int64"]).columns
+        new_scorecard_df[num_cols_sc] = new_scorecard_df[num_cols_sc].fillna(0)
+        new_scorecard_df = new_scorecard_df.sort_values(["Date", "Agent"])
+        new_scorecard_df = new_scorecard_df.rename(columns={"AgentEmail": "Email"})
+        new_scorecard_df["Email"] = new_scorecard_df["Email"].astype("string").str.lower().str.strip()
+        new_scorecard_df = new_scorecard_df.merge(manager_map, on="Email", how="left")
+
+        scorecard_ordered_cols = [
+            "Date", "Email", "Manager Email",
+            "Builds rapport by engaging customer",
+            "Builds_rapport_IsOpportunity", "Builds_rapport_IsDefect",
+            "Confirms customer's satisfaction with call outcome",
+            "Confirms_customer_IsOpportunity", "Confirms_customer_IsDefect",
+            "Maintains call control to guide conversation",
+            "Maintains_call_IsOpportunity", "Maintains_call_IsDefect",
+            "Personalizes call by using customer's name",
+            "Personalizes_call_IsOpportunity", "Personalizes_call_IsDefect",
+            "Takes ownership & displays willingness to help",
+            "Takes_ownership_IsOpportunity", "Takes_ownership_IsDefect",
+            "Total_Eval", "Behaviors_IsOpportunity", "Behaviors_IsDefect",
+            "IsOpportunity_Sum", "IsDefect_Sum", "DefectRate",
+            "Delight", "Audibly_Happy_Sum", "Delight_Response_Sum",
+        ]
+        scorecard_ordered_cols = [c for c in scorecard_ordered_cols if c in new_scorecard_df.columns]
+        new_scorecard_df = new_scorecard_df.reindex(columns=scorecard_ordered_cols)
+        logging.info(f"New scorecard rows: {len(new_scorecard_df)}")
+
+        # =================================================================
+        # STEP 13: Manager hierarchy rollup
+        # =================================================================
+        manager_final_df   = pd.DataFrame()
+        hierarchy_available = False
+
+        try:
+            logging.info("Starting manager hierarchy rollup...")
+            behavior_stats["Email"] = behavior_stats["Agent"].map(agent_name_to_email_dict)
+            if not delight_df.empty:
+                delight_df["Email"] = delight_df["Agent"].map(agent_name_to_email_dict)
+
+            current_behavior = behavior_stats[[
+                "Date", "Email", "Behavior Text", "IsDefect", "IsOpportunity", "DefectRate"
+            ]].copy()
+            current_delight = (
+                delight_df[["Date", "Email", "Response"]].copy()
+                if not delight_df.empty else pd.DataFrame()
+            )
+
+            all_manager_behavior_data = []
+            all_manager_delight_data  = []
+            max_levels = 10
+            level = 1
+
+            while level <= max_levels:
+                logging.info(f"=== Hierarchy Level {level} ===")
+                employees_with_data   = current_behavior["Email"].unique()
+                employees_to_rollup   = [e for e in employees_with_data if e in email_to_manager]
+                logging.info(f"  Employees with manager mappings: {len(employees_to_rollup)}")
+
+                if not employees_to_rollup:
+                    break
+
+                current_behavior["Manager"] = current_behavior["Email"].map(email_to_manager)
+                behavior_to_rollup = current_behavior[current_behavior["Manager"].notna()].copy()
+
+                if behavior_to_rollup.empty:
+                    break
+
+                manager_behavior = (
+                    behavior_to_rollup
+                    .groupby(["Date", "Manager", "Behavior Text"], as_index=False, observed=True)
+                    .agg({"IsDefect": "sum", "IsOpportunity": "sum"})
+                )
+                manager_behavior["DefectRate"] = (
+                    manager_behavior["IsDefect"]
+                    / manager_behavior["IsOpportunity"].replace(0, float("nan"))
+                ).fillna(0).round(2)
+                all_manager_behavior_data.append(manager_behavior.copy())
+
+                if not current_delight.empty:
+                    current_delight["Manager"] = current_delight["Email"].map(email_to_manager)
+                    delight_to_rollup = current_delight[current_delight["Manager"].notna()].copy()
+
+                    if not delight_to_rollup.empty and "Response" in delight_to_rollup.columns:
+                        mgr_delight_resp = (
+                            delight_to_rollup
+                            .groupby(["Date", "Manager", "Response"], dropna=False, observed=True)
+                            .size()
+                            .unstack("Response", fill_value=0)
+                            .reset_index()
+                        )
+                        for col in ["Audibly happy", "Neutral", "Irate"]:
+                            if col not in mgr_delight_resp.columns:
+                                mgr_delight_resp[col] = 0
+                        denom = (
+                            mgr_delight_resp[["Audibly happy", "Neutral", "Irate"]]
+                            .sum(axis=1).replace(0, float("nan"))
+                        )
+                        mgr_delight_resp["Delight"] = (
+                            mgr_delight_resp["Audibly happy"] / denom
+                        ).fillna(0).round(3)
+                        manager_delight = mgr_delight_resp[["Date", "Manager", "Delight"]]
+                        all_manager_delight_data.append(manager_delight.copy())
+                        current_delight = manager_delight.rename(columns={"Manager": "Email"})
+
+                current_behavior = manager_behavior.rename(columns={"Manager": "Email"})
+                current_behavior = current_behavior[[
+                    "Date", "Email", "Behavior Text", "IsDefect", "IsOpportunity", "DefectRate"
+                ]]
+                level += 1
+                gc.collect()
+
+            if all_manager_behavior_data:
+                hierarchy_available = True
+                all_mgr_behavior = pd.concat(all_manager_behavior_data, ignore_index=True)
+
+                mgr_behavior_pivot = (
+                    all_mgr_behavior
+                    .pivot_table(
+                        index=["Date", "Manager"], columns="Behavior Text",
+                        values="DefectRate", aggfunc="first", observed=True,
+                    ).round(2).reset_index()
+                )
+                mgr_totals = (
+                    all_mgr_behavior
+                    .groupby(["Date", "Manager"], as_index=False, observed=True)
+                    .agg({"IsDefect": "sum", "IsOpportunity": "sum"})
+                )
+                mgr_totals["DefectRate"] = (
+                    mgr_totals["IsDefect"]
+                    / mgr_totals["IsOpportunity"].replace(0, float("nan"))
+                ).fillna(0).round(2)
+                mgr_totals = mgr_totals.rename(columns={
+                    "IsDefect":     "IsDefect_Sum",
+                    "IsOpportunity":"IsOpportunity_Sum",
+                })
+
+                mgr_focused = all_mgr_behavior[
+                    all_mgr_behavior["Behavior Text"].isin(target_behaviors)
+                ]
+                mgr_behaviors_totals = (
+                    mgr_focused
+                    .groupby(["Date", "Manager"], as_index=False, observed=True)
+                    .agg({"IsDefect": "sum", "IsOpportunity": "sum"})
+                    .rename(columns={
+                        "IsDefect":     "Behaviors_IsDefect",
+                        "IsOpportunity":"Behaviors_IsOpportunity",
+                    })
+                )
+                mgr_behaviors_totals["Focused_DefectRate"] = (
+                    mgr_behaviors_totals["Behaviors_IsDefect"]
+                    / mgr_behaviors_totals["Behaviors_IsOpportunity"].replace(0, float("nan"))
+                ).fillna(0).round(4)
+
+                mgr_delight_final = pd.DataFrame(columns=["Date", "Manager", "Delight"])
+                if all_manager_delight_data:
+                    mgr_delight_final = (
+                        pd.concat(all_manager_delight_data, ignore_index=True)
+                        [["Date", "Manager", "Delight"]]
+                        .drop_duplicates(subset=["Date", "Manager"], keep="last")
+                    )
+
+                manager_final_df = (
+                    mgr_behavior_pivot
+                    .merge(mgr_totals,           on=["Date", "Manager"], how="left")
+                    .merge(mgr_behaviors_totals, on=["Date", "Manager"], how="left")
+                    .merge(mgr_delight_final,    on=["Date", "Manager"], how="left")
+                )
+                manager_final_df = manager_final_df.rename(columns={"Manager": "Email"})
+                manager_final_df["Manager Email"] = manager_final_df["Email"].map(email_to_manager)
+
+                num_cols_mgr = manager_final_df.select_dtypes(include=["float64", "int64"]).columns
+                manager_final_df[num_cols_mgr] = manager_final_df[num_cols_mgr].fillna(0)
+
+                mgr_ordered_cols = [
+                    "Date", "Email",
+                    "Builds rapport by engaging customer",
+                    "Confirms customer's satisfaction with call outcome",
+                    "Maintains call control to guide conversation",
+                    "Personalizes call by using customer's name",
+                    "Takes ownership & displays willingness to help",
+                    "Behaviors_IsOpportunity", "Behaviors_IsDefect", "Focused_DefectRate",
+                    "IsOpportunity_Sum", "IsDefect_Sum", "DefectRate", "Delight",
+                ]
+                mgr_ordered_cols = [c for c in mgr_ordered_cols if c in manager_final_df.columns]
+                manager_final_df = manager_final_df[mgr_ordered_cols].sort_values(["Date", "Email"])
+                logging.info(f"New manager rows: {len(manager_final_df)}")
+
+        except Exception as e:
+            logging.error(f"Manager hierarchy rollup error: {str(e)}", exc_info=True)
+            manager_final_df   = pd.DataFrame()
+            hierarchy_available = False
+
+        gc.collect()
+
+        # =================================================================
+        # STEP 14: Build report output
+        # =================================================================
+        logging.info("Building report dataframe...")
+
+        df_users["Full Name"] = (
+            df_users["FirstName"].fillna("").astype(str).str.strip()
+            + " "
+            + df_users["LastName"].fillna("").astype(str).str.strip()
+        ).str.strip().str.title()
+        df_users["Full Name"] = df_users["Full Name"].str.replace(
+            r"\b(O'|Mc)([a-z])",
+            lambda m: m.group(1) + m.group(2).upper(), regex=True,
+        )
+        email_to_fullname = dict(zip(df_users["Email"], df_users["Full Name"]))
+        email_to_teamname = dict(zip(
+            df_users["Email"],
+            df_users.get("team_name", pd.Series(dtype="string")),
+        ))
+
+        new_report_df = agent_info.copy()
+        new_report_df["_eval_date"]        = pd.to_datetime(new_report_df["Evaluation Date"])
+        new_report_df["Month of Evaluation"] = new_report_df["_eval_date"].dt.strftime("%B %Y")
+        new_report_df["_month_sort"]       = (
+            new_report_df["_eval_date"].dt.to_period("M").apply(lambda x: x.to_timestamp())
+        )
+        new_report_df["Email"] = (
+            new_report_df["AgentEmail"].astype("string").str.lower().str.strip()
+        )
+        new_report_df["Agent Full Name"] = new_report_df["Email"].map(email_to_fullname)
+        new_report_df["_agent_from_tpg"]  = last_first_to_first_last(new_report_df["Agent"])
+        new_report_df["Agent Full Name"]  = new_report_df["Agent Full Name"].fillna(
+            new_report_df["_agent_from_tpg"]
+        )
+        new_report_df["Team Lead Email"]      = new_report_df["Email"].map(email_to_manager)
+        new_report_df["Team Lead Full Name"]  = new_report_df["Team Lead Email"].map(email_to_fullname)
+        new_report_df["_supervisor_from_tpg"] = last_first_to_first_last(new_report_df["Supervisor"])
+        new_report_df["Team Lead Full Name"]  = new_report_df["Team Lead Full Name"].fillna(
+            new_report_df["_supervisor_from_tpg"]
+        )
+        new_report_df["Dept Manager Email"]            = new_report_df["Team Lead Email"].map(email_to_manager)
+        new_report_df["Department Manager Full Name"]  = new_report_df["Dept Manager Email"].map(email_to_fullname)
+        new_report_df["Team Name"] = new_report_df["Email"].map(email_to_teamname)
+
+        new_report_df = (
+            new_report_df
+            .merge(behavior_pivot_4dec,   on=["Date", "Agent"], how="left")
+            .merge(behavior_opp_pivot,    on=["Date", "Agent"], how="left")
+            .merge(behavior_defect_pivot, on=["Date", "Agent"], how="left")
+            .merge(
+                totals[["Date", "Agent", "Total_Eval", "IsOpportunity_Sum",
+                        "IsDefect_Sum", "DefectRate_4dec"]],
+                on=["Date", "Agent"], how="left",
+            )
+            .rename(columns={"DefectRate_4dec": "Overall Defect Rate"})
+            .merge(behaviors_totals, on=["Date", "Agent"], how="left")
+            .rename(columns={"Focused_DefectRate": "Focused Defect Rate"})
+            .merge(
+                delight_counts[["Date", "Agent", "Delight_4dec",
+                                "Audibly_Happy_Sum", "Delight_Response_Sum"]],
+                on=["Date", "Agent"], how="left",
+            )
+            .rename(columns={"Delight_4dec": "Overall Delight Rate"})
+        )
+
+        del totals, behaviors_totals, delight_counts
+        del behavior_pivot_4dec, behavior_pivot, behavior_opp_pivot, behavior_defect_pivot
+        del behavior_stats, delight_df, agent_info
+        gc.collect()
+
+        new_report_df = new_report_df.rename(columns={
+            "Builds rapport by engaging customer":                  "Builds Rapport Defect Rate",
+            "Confirms customer's satisfaction with call outcome":   "Confirms Satisfaction Defect Rate",
+            "Maintains call control to guide conversation":         "Maintains Call Control Defect Rate",
+            "Personalizes call by using customer's name":           "Personalizes Call Defect Rate",
+            "Takes ownership & displays willingness to help":       "Takes Ownership Defect Rate",
+        })
+
+        num_cols_rpt = new_report_df.select_dtypes(include=["float64", "int64"]).columns
+        new_report_df[num_cols_rpt] = new_report_df[num_cols_rpt].fillna(0)
+        new_report_df = new_report_df.sort_values(
+            ["_month_sort", "Department Manager Full Name",
+             "Team Lead Full Name", "Agent Full Name", "Date"],
+            na_position="last",
+        )
+
+        report_ordered_cols = [
+            "Department Manager Full Name", "Team Lead Full Name", "Team Name",
+            "Agent Full Name", "Date", "Month of Evaluation",
+            "Builds Rapport Defect Rate",
+            "Builds_rapport_IsOpportunity", "Builds_rapport_IsDefect",
+            "Confirms Satisfaction Defect Rate",
+            "Confirms_customer_IsOpportunity", "Confirms_customer_IsDefect",
+            "Maintains Call Control Defect Rate",
+            "Maintains_call_IsOpportunity", "Maintains_call_IsDefect",
+            "Personalizes Call Defect Rate",
+            "Personalizes_call_IsOpportunity", "Personalizes_call_IsDefect",
+            "Takes Ownership Defect Rate",
+            "Takes_ownership_IsOpportunity", "Takes_ownership_IsDefect",
+            "Behaviors_IsOpportunity", "Behaviors_IsDefect",
+            "Focused Defect Rate", "Overall Defect Rate", "Overall Delight Rate",
+            "Audibly_Happy_Sum", "Delight_Response_Sum",
+            "Total_Eval", "IsOpportunity_Sum", "IsDefect_Sum",
+        ]
+        report_ordered_cols = [c for c in report_ordered_cols if c in new_report_df.columns]
+        new_report_df = new_report_df[report_ordered_cols]
+        new_report_df = new_report_df.dropna(
+            subset=["Department Manager Full Name", "Team Lead Full Name"], how="all"
+        )
+        logging.info(f"New report rows: {len(new_report_df)}")
+
+        # =================================================================
+        # STEP 15: Append and save all outputs
+        # =================================================================
+        logging.info("Appending and saving all output files...")
+
+        # Agent
+        combined_agent = (
+            pd.concat([existing_agent_df, new_agent_df], ignore_index=True)
+            .sort_values(["Date", "Email"])
+        )
+        save_csv(storage_container, combined_agent, "TPG/CENTRICAL_TPG.csv")
+        del combined_agent, existing_agent_df, new_agent_df
+        gc.collect()
+
+        # Scorecard
+        combined_scorecard = (
+            pd.concat([existing_scorecard_df, new_scorecard_df], ignore_index=True)
+            .sort_values(["Date", "Email"])
+        )
+        save_csv(scorecard_container, combined_scorecard, "Scorecard/CENTRICAL_TPG.csv")
+        del combined_scorecard, existing_scorecard_df, new_scorecard_df
+        gc.collect()
+
+        # Manager
+        if hierarchy_available and not manager_final_df.empty:
+            combined_manager = (
+                pd.concat([existing_manager_df, manager_final_df], ignore_index=True)
+                .sort_values(["Date", "Email"])
+            )
+            save_csv(storage_container, combined_manager, "TPG/CENTRICAL_TPG_MANAGER.csv")
+            del combined_manager
+        else:
+            logging.warning("No new manager data to append")
+        del existing_manager_df, manager_final_df
+        gc.collect()
+
+        # Report (4 decimal float format)
+        combined_report = pd.concat([existing_report_df, new_report_df], ignore_index=True)
+        if "_month_sort" not in combined_report.columns:
+            combined_report["_month_sort"] = (
+                pd.to_datetime(combined_report["Date"], errors="coerce")
+                .dt.to_period("M")
+                .apply(lambda x: x.to_timestamp())
+            )
+        combined_report = combined_report.sort_values(
+            ["_month_sort", "Department Manager Full Name",
+             "Team Lead Full Name", "Agent Full Name", "Date"],
+            na_position="last",
+        ).drop(columns=["_month_sort"], errors="ignore")
+
+        save_csv(ccc_container, combined_report, "Peter/TPG_REPORT.csv", float_fmt="%.4f")
+        del combined_report, existing_report_df, new_report_df
+        gc.collect()
+
+        logging.info("Process completed successfully!")
+        return func.HttpResponse(
+            f"Process completed successfully!\n"
+            f"New dates processed: {len(new_dates)}\n"
+            f"New dates: {sorted(str(d) for d in new_dates)}",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logging.error(f"FATAL ERROR in process function: {str(e)}", exc_info=True)
+        import json
+        return func.HttpResponse(
+            json.dumps({
+                "error":     str(e),
+                "type":      type(e).__name__,
+                "traceback": traceback.format_exc(),
+            }),
+            status_code=500,
+            mimetype="application/json",
+        )
